@@ -1,5 +1,5 @@
 import streamlit as st
-from scraper import scrape_images_with_login_sync
+from scraper import scrape_images_with_login_sync as scrape_images_with_login
 
 st.set_page_config(page_title="Downloader immagini (login)", layout="centered")
 st.title("Downloader immagini (con login)")
