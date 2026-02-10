@@ -1,19 +1,19 @@
-# scraper.py
 import io
 import os
 import re
 import time
 import zipfile
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# IMPORTANT: su Streamlit Cloud evita download browser via Playwright
-os.environ.setdefault("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+# Evita che Playwright provi a scaricare browser in Streamlit Cloud
+os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
 
 
 # -----------------------
@@ -34,15 +34,8 @@ def _clean_filename(name: str) -> str:
 
 
 def _guess_chromium_executable() -> Optional[str]:
-    """
-    Streamlit Cloud: installa chromium via apt (packages.txt) e usalo con executable_path.
-    Percorsi tipici:
-      - /usr/bin/chromium
-      - /usr/bin/chromium-browser
-    """
     candidates = [
         os.environ.get("CHROME_PATH", ""),
-        os.environ.get("CHROMIUM_PATH", ""),
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome",
@@ -54,78 +47,186 @@ def _guess_chromium_executable() -> Optional[str]:
     return None
 
 
-def _extract_image_urls(html: str, base_url: str) -> List[str]:
+def _normalize_color_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("à", "a").replace("è", "e").replace("é", "e").replace("ì", "i").replace("ò", "o").replace("ù", "u")
+    return s
+
+
+def _wanted_color_match(color_label: str, wanted: List[str]) -> bool:
+    """
+    wanted: lista di colori target in italiano (nero, bianco, rosso, blu navy, blu royal, grigio).
+    Proviamo a matchare con sinonimi/varianti comuni.
+    """
+    c = _normalize_color_name(color_label)
+
+    synonyms = {
+        "nero": ["nero", "black", "noir", "schwarz"],
+        "bianco": ["bianco", "white", "blanc", "weiss"],
+        "rosso": ["rosso", "red", "rouge", "rot", "bordeaux", "burgundy"],  # bordeaux spesso è “rosso scuro”
+        "blu navy": ["navy", "blu navy", "blu notte", "midnight", "marine", "dark blue"],
+        "blu royal": ["royal", "blu royal", "royal blue", "blu reale", "electric blue", "azzurro royal"],
+        "grigio": ["grigio", "grey", "gray", "antracite", "anthracite", "charcoal", "melange", "mélange"],
+    }
+
+    wanted_norm = [_normalize_color_name(w) for w in wanted]
+    for w in wanted_norm:
+        # match diretto
+        if w in c:
+            return True
+        # match per cluster sinonimi
+        for syn in synonyms.get(w, []):
+            if syn in c:
+                return True
+    return False
+
+
+def _build_color_map_from_html(html: str) -> Dict[str, str]:
+    """
+    Mappa best-effort: data-color -> label testuale (se presente in pagina).
+    Non conosciamo al 100% la struttura del sito, quindi facciamo euristiche.
+    """
     soup = BeautifulSoup(html, "lxml")
-    urls = set()
+    out: Dict[str, str] = {}
 
-    # img tags
-    for img in soup.select("img"):
-        for attr in ("src", "data-src", "data-lazy", "data-original", "data-zoom-image"):
-            u = img.get(attr)
-            if u:
-                urls.add(urljoin(base_url, u))
+    # Qualsiasi elemento con attributo data-color che contiene anche un testo utile
+    for el in soup.select("[data-color]"):
+        dc = str(el.get("data-color") or "").strip()
+        if not dc:
+            continue
 
-    # anchor links diretti a immagini
-    for a in soup.select("a[href]"):
-        href = a.get("href")
-        if href:
-            full = urljoin(base_url, href)
-            if re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", full, re.I):
-                urls.add(full)
+        # prova: titolo/label vicino
+        txt = _normalize_color_name(el.get_text(" ", strip=True))
+        title = _normalize_color_name(el.get("title") or "")
+        aria = _normalize_color_name(el.get("aria-label") or "")
+        data_name = _normalize_color_name(el.get("data-name") or "")
 
-    # immagini dentro style="background-image:url(...)"
-    for tag in soup.find_all(style=True):
-        s = tag.get("style") or ""
-        for m in re.findall(r'url\((["\']?)(.*?)\1\)', s, flags=re.I):
-            full = urljoin(base_url, m[1])
-            if re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", full, re.I):
-                urls.add(full)
+        label = next((t for t in [data_name, title, aria, txt] if t), "")
+        if label and dc not in out:
+            out[dc] = label
 
-    # pulizia
-    out = [u for u in urls if _is_http_url(u)]
-    out.sort()
     return out
 
 
-def _download_to_zip(
-    session: requests.Session,
-    img_urls: List[str],
-    per_request_timeout: int = 30,
-) -> Tuple[bytes, List[str], List[str]]:
-    ok, failed = [], []
+def _extract_gallery_candidates(html: str, base_url: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    Estrae SOLO immagini della galleria principale.
+    Ritorna lista di tuple (url_assoluto, data_color opzionale)
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out: List[Tuple[str, Optional[str]]] = []
+
+    # Target principale che hai indicato
+    for img in soup.select("#js_productMainPhoto img.callToZoom, #js_productMainPhoto img"):
+        u = img.get("src") or img.get("data-src") or img.get("data-original")
+        if not u:
+            continue
+        out.append((urljoin(base_url, u), str(img.get("data-color") or "").strip() or None))
+
+    # In molti siti ci sono thumb/alt foto con classi simili (callToZoom)
+    for img in soup.select("img.callToZoom"):
+        u = img.get("src") or img.get("data-src") or img.get("data-original")
+        if not u:
+            continue
+        out.append((urljoin(base_url, u), str(img.get("data-color") or "").strip() or None))
+
+    # Dedup mantenendo ordine
+    seen = set()
+    uniq: List[Tuple[str, Optional[str]]] = []
+    for u, dc in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append((u, dc))
+
+    return uniq
+
+
+def _url_variants_highres(url: str) -> List[str]:
+    """
+    Genera candidate URL "più grandi" a partire da una URL tipo:
+    /media/.../opt-490x735-rj265m.jpg
+
+    Strategie:
+    - rimuovi prefix opt-WxH-
+    - rimuovi qualsiasi opt-...- (generico)
+    - prova a sostituire con misure comuni (solo se serve)
+    """
+    variants = [url]
+
+    # Caso tipico: opt-490x735-<name>.jpg  => <name>.jpg
+    v1 = re.sub(r"/opt-\d+x\d+-", "/", url)
+    if v1 != url:
+        variants.append(v1)
+
+    # Generico: opt-QUALCOSA-  => togli opt-
+    v2 = re.sub(r"/opt-[^/]+-", "/", url)
+    if v2 != url and v2 not in variants:
+        variants.append(v2)
+
+    # Se rimane nel filename: .../opt-490x735-rj265m.jpg
+    v3 = re.sub(r"opt-\d+x\d+-", "", url)
+    if v3 != url and v3 not in variants:
+        variants.append(v3)
+
+    # Alcuni siti hanno “large/zoom” ecc. (best effort)
+    variants.append(url.replace("/opt-", "/"))
+
+    # Dedup
+    out = []
+    seen = set()
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _fetch_image_info(session: requests.Session, url: str) -> Optional[Tuple[bytes, int, int]]:
+    """
+    Scarica l'immagine e ritorna (bytes, width, height) se è un'immagine valida.
+    """
+    try:
+        r = session.get(url, timeout=30)
+        if r.status_code != 200 or not r.content:
+            return None
+        data = r.content
+        im = Image.open(io.BytesIO(data))
+        w, h = im.size
+        return data, int(w), int(h)
+    except Exception:
+        return None
+
+
+def _best_highres_image(session: requests.Session, url: str, debug: List[str]) -> Tuple[str, Optional[bytes]]:
+    """
+    Prova varianti URL e sceglie quella con area (w*h) maggiore.
+    """
+    best = None  # (area, w, h, url, bytes)
+    for v in _url_variants_highres(url):
+        info = _fetch_image_info(session, v)
+        if not info:
+            continue
+        data, w, h = info
+        area = w * h
+        if (best is None) or (area > best[0]):
+            best = (area, w, h, v, data)
+
+    if best:
+        debug.append(f"Highres OK: {url} -> {best[3]} ({best[1]}x{best[2]})")
+        return best[3], best[4]
+
+    debug.append(f"Highres FAIL: {url} (nessuna variante valida)")
+    return url, None
+
+
+def _download_to_zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
     mem = io.BytesIO()
-
     with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for i, url in enumerate(img_urls, start=1):
-            try:
-                r = session.get(url, timeout=per_request_timeout)
-                if r.status_code != 200 or not r.content:
-                    failed.append(f"{url} (HTTP {r.status_code})")
-                    continue
-
-                ext = None
-                ct = (r.headers.get("content-type") or "").lower()
-                if "jpeg" in ct:
-                    ext = ".jpg"
-                elif "png" in ct:
-                    ext = ".png"
-                elif "webp" in ct:
-                    ext = ".webp"
-                elif "gif" in ct:
-                    ext = ".gif"
-
-                if not ext:
-                    m = re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", url, re.I)
-                    ext = "." + m.group(1).lower().replace("jpeg", "jpg") if m else ".bin"
-
-                filename = _clean_filename(f"img_{i:03d}{ext}")
-                zf.writestr(filename, r.content)
-                ok.append(url)
-            except Exception as e:
-                failed.append(f"{url} ({type(e).__name__})")
-
+        for i, (name, content) in enumerate(files, start=1):
+            zf.writestr(name, content)
     mem.seek(0)
-    return mem.getvalue(), ok, failed
+    return mem.getvalue()
 
 
 @dataclass
@@ -138,7 +239,7 @@ class ScrapeResult:
 
 
 # -----------------------
-# Main scraping function
+# Main
 # -----------------------
 
 def scrape_images_with_login_sync(
@@ -147,26 +248,17 @@ def scrape_images_with_login_sync(
     password: str,
     headless: bool = True,
     timeout_ms: int = 30000,
+    wanted_colors: Optional[List[str]] = None,
 ) -> ScrapeResult:
-    """
-    Flusso:
-    - apri product_url
-    - clicca "Accedi" (apre modal inline)
-    - compila email/password nel modal e submit
-    - ricarica product_url mantenendo sessione
-    - estrai immagini dalla pagina post-login
-    - scarica immagini e crea zip
-    """
     debug: List[str] = []
+    wanted_colors = wanted_colors or ["nero", "bianco", "rosso", "blu navy", "blu royal", "grigio"]
 
     chromium_path = _guess_chromium_executable()
     if not chromium_path:
         raise RuntimeError(
             "Chromium non trovato nel container. "
-            "Assicurati che in packages.txt ci sia 'chromium' e (consigliato) 'chromium-driver'. "
-            "Oppure imposta CHROME_PATH."
+            "Aggiungi 'chromium' in packages.txt (obbligatorio) oppure imposta CHROME_PATH."
         )
-    debug.append(f"Chromium path: {chromium_path}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -177,96 +269,99 @@ def scrape_images_with_login_sync(
                 "--disable-dev-shm-usage",
                 "--disable-setuid-sandbox",
                 "--disable-gpu",
+                "--single-process",
             ],
         )
-
-        # UA “normale” (aiuta con siti schizzinosi)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            )
-        )
+        context = browser.new_context()
         page = context.new_page()
 
-        # 1) open prodotto
         debug.append(f"Open product: {product_url}")
         page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_load_state("networkidle", timeout=timeout_ms)
 
-        # 2) apri modal login
-        debug.append("Click login trigger (modal)")
+        # Click login trigger (popup/modal)
+        debug.append("Click login trigger (popup/modal)")
         page.click("a.login.js_popupLogin", timeout=timeout_ms)
 
-        # 3) aspetta modal visibile
-        debug.append("Wait modal visible")
-        page.wait_for_selector("#js_popupSignInBody", state="visible", timeout=timeout_ms)
+        # Form nel modal che mi hai dato: #user_email, #user_password, submit .js_popupDoLogin
+        debug.append("Fill login form in modal")
+        page.wait_for_selector("#js_popupSignInBody #user_email", timeout=timeout_ms)
+        page.fill("#js_popupSignInBody #user_email", email)
+        page.fill("#js_popupSignInBody #user_password", password)
 
-        # 4) fill credenziali usando ID certi del tuo HTML
-        debug.append("Fill credentials (modal)")
-        page.fill("#user_email", email, timeout=timeout_ms)
-        page.fill("#user_password", password, timeout=timeout_ms)
+        debug.append("Submit login")
+        page.click("#js_popupSignInBody .js_popupDoLogin", timeout=timeout_ms)
 
-        # 5) submit
-        debug.append("Submit login (modal)")
-        page.click("input.js_popupDoLogin", timeout=timeout_ms)
+        # attesa breve per cookie/sessione
+        time.sleep(1.2)
 
-        # 6) attendi chiusura modal o stabilizzazione rete
-        debug.append("Wait modal to close / network idle")
-        try:
-            page.wait_for_selector("#js_popupSignInBody", state="hidden", timeout=timeout_ms)
-        except PlaywrightTimeoutError:
-            # alcuni siti non "nascondono" subito il body del modal
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
-
-        time.sleep(0.5)
-
-        # 7) reload product post-login
-        debug.append("Reload product page after login")
+        # reload prodotto con sessione attiva
+        debug.append("Reload product after login")
         page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_load_state("networkidle", timeout=timeout_ms)
-        time.sleep(0.4)
+        time.sleep(1.0)
 
         html = page.content()
-        img_urls = _extract_image_urls(html, product_url)
-        debug.append(f"Found {len(img_urls)} image urls in HTML")
 
-        # 8) cookies Playwright -> requests
-        cookies = context.cookies()
+        # Mappa data-color -> label (best effort)
+        color_map = _build_color_map_from_html(html)
+        if color_map:
+            debug.append(f"Color map candidates: {color_map}")
+
+        # Estrai SOLO galleria
+        candidates = _extract_gallery_candidates(html, product_url)
+        debug.append(f"Gallery candidates: {len(candidates)}")
+
+        # Filtra per colori desiderati se possibile
+        filtered: List[str] = []
+        for url, dc in candidates:
+            if dc and dc in color_map:
+                label = color_map[dc]
+                if _wanted_color_match(label, wanted_colors):
+                    filtered.append(url)
+            else:
+                # se non sappiamo il colore, NON scartiamo subito (meglio scaricare che perdere)
+                filtered.append(url)
+
+        # Dedup
+        filtered = list(dict.fromkeys(filtered))
+        debug.append(f"After color filter (best effort): {len(filtered)}")
+
+        # requests session con cookie Playwright
         sess = requests.Session()
-        sess.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "Accept": "*/*",
-                "Referer": product_url,
-            }
-        )
-        for c in cookies:
-            # domain può essere ".example.com" o "example.com" -> requests accetta
-            sess.cookies.set(
-                c["name"],
-                c["value"],
-                domain=c.get("domain"),
-                path=c.get("path") or "/",
-            )
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; ImageDownloader/1.0)",
+            "Accept": "*/*",
+            "Referer": product_url,
+        })
+        for c in context.cookies():
+            sess.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path"))
 
-        # 9) download zip
-        zip_bytes, ok, failed = _download_to_zip(sess, img_urls)
+        ok_urls: List[str] = []
+        failed: List[str] = []
+        files_for_zip: List[Tuple[str, bytes]] = []
 
-        debug.append(f"Downloaded OK: {len(ok)}")
-        debug.append(f"Downloaded failed: {len(failed)}")
+        for i, url in enumerate(filtered, start=1):
+            best_url, data = _best_highres_image(sess, url, debug)
+            if not data:
+                failed.append(url)
+                continue
 
+            # estensione da url finale
+            ext = ".jpg"
+            m = re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", best_url, re.I)
+            if m:
+                ext = "." + m.group(1).lower().replace("jpeg", "jpg")
+
+            filename = _clean_filename(f"gallery_{i:03d}{ext}")
+            files_for_zip.append((filename, data))
+            ok_urls.append(best_url)
+
+        zip_bytes = _download_to_zip_bytes(files_for_zip)
         browser.close()
 
         return ScrapeResult(
             zip_bytes=zip_bytes,
-            found_image_urls=img_urls,
-            downloaded_ok=ok,
+            found_image_urls=filtered,
+            downloaded_ok=ok_urls,
             downloaded_failed=failed,
             debug=debug,
         )
