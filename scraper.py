@@ -237,6 +237,138 @@ class ScrapeResult:
     downloaded_failed: List[str]
     debug: List[str]
 
+def _safe_click(page, selector: str, timeout_ms: int, debug: List[str]) -> bool:
+    try:
+        page.click(selector, timeout=timeout_ms)
+        return True
+    except Exception as e:
+        debug.append(f"Click failed: {selector} ({type(e).__name__})")
+        return False
+
+
+def _collect_images_by_clicking_colors(page, base_url: str, timeout_ms: int, debug: List[str]) -> List[Tuple[str, Optional[str]]]:
+    """
+    Clicca tutte le varianti colore e raccoglie l'immagine principale per ciascuna.
+    Ritorna: [(img_url, data_color)]
+    """
+    results: List[Tuple[str, Optional[str]]] = []
+
+    main_img_sel = "#js_productMainPhoto img"
+    page.wait_for_selector(main_img_sel, timeout=timeout_ms)
+
+    def get_main_src_and_color() -> Tuple[Optional[str], Optional[str]]:
+        el = page.query_selector(main_img_sel)
+        if not el:
+            return None, None
+        src = el.get_attribute("src") or el.get_attribute("data-src")
+        dc = el.get_attribute("data-color")
+        if src:
+            src = urljoin(base_url, src)
+        return src, (dc.strip() if dc else None)
+
+    # 1) prova a prendere tutti i "color swatch" cliccabili (euristica)
+    # - qualunque elemento con data-color
+    # - link/bottoni/label spesso usati per varianti
+    color_selectors = [
+        '[data-color]',                 # generico
+        'a[data-color]',
+        'button[data-color]',
+        'label[data-color]',
+        'li[data-color]',
+        '.js_changeColor [data-color]', # se esiste
+        '.colors [data-color]',
+        '.color [data-color]',
+        '#js_colors [data-color]',
+    ]
+
+    # prendi lista unica di elementi (Playwright locator-based)
+    handles = []
+    seen = set()
+    for sel in color_selectors:
+        for h in page.query_selector_all(sel):
+            # evita duplicati: usa outerHTML hash (grezzo ma funziona)
+            try:
+                key = h.evaluate("el => el.outerHTML")[:200]
+            except Exception:
+                key = str(h)
+            if key in seen:
+                continue
+            seen.add(key)
+            handles.append(h)
+
+    debug.append(f"Color candidates found: {len(handles)}")
+
+    # Se non troviamo nulla, ritorniamo solo la featured
+    if not handles:
+        src, dc = get_main_src_and_color()
+        if src:
+            results.append((src, dc))
+        return results
+
+    # 2) clicca ogni variante e aspetta cambio immagine
+    baseline_src, _ = get_main_src_and_color()
+    collected_src = set()
+
+    for idx, h in enumerate(handles, start=1):
+        # alcuni elementi non sono visibili/cliccabili -> prova scroll e click
+        try:
+            h.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        # prova click direttamente sul handle
+        old_src, _ = get_main_src_and_color()
+
+        clicked = False
+        try:
+            h.click(timeout=2000)
+            clicked = True
+        except Exception:
+            # fallback: prova click via JS
+            try:
+                page.evaluate("(el) => el.click()", h)
+                clicked = True
+            except Exception:
+                clicked = False
+
+        if not clicked:
+            continue
+
+        # aspetta che cambi src (o che si stabilizzi)
+        try:
+            page.wait_for_function(
+                """(sel, oldSrc) => {
+                    const el = document.querySelector(sel);
+                    if(!el) return false;
+                    const s = el.getAttribute('src') || el.getAttribute('data-src') || '';
+                    return s && s !== oldSrc;
+                }""",
+                arg=(main_img_sel, old_src or ""),
+                timeout=timeout_ms,
+            )
+        except Exception:
+            # non sempre cambia src (alcuni swatch duplicati) => prosegui comunque
+            pass
+
+        time.sleep(0.3)
+
+        src, dc = get_main_src_and_color()
+        if not src:
+            continue
+
+        if src in collected_src:
+            continue
+
+        collected_src.add(src)
+        results.append((src, dc))
+        debug.append(f"[{idx}] Collected main image: {src} (data-color={dc})")
+
+    # se per qualche motivo non ha raccolto nulla, fallback featured
+    if not results and baseline_src:
+        results.append((baseline_src, None))
+
+    return results
+
 
 # -----------------------
 # Main
