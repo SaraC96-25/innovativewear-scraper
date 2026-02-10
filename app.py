@@ -35,14 +35,17 @@ if st.button("Scarica ZIP immagini", use_container_width=True, type="primary"):
             password=password,
             headless=headless,
         )
+
         zip_bytes = result.zip_bytes
         found = result.found_image_urls
         ok = result.downloaded_ok
         failed = result.downloaded_failed
         debug = result.debug
+
     except Exception as e:
         st.error(f"Errore: {type(e).__name__}: {e}")
         st.stop()
+
 
     st.success(f"Immagini trovate: {len(found)} — scaricate: {len(ok)} — fallite: {len(failed)}")
 
