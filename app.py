@@ -13,7 +13,7 @@ product_url = st.text_input("URL prodotto", "")
 email = st.text_input("Email / codice utente", value=default_email)
 password = st.text_input("Password", value=default_password, type="password")
 
-col1, col2 = st.columns([1,1])
+col1, col2 = st.columns([1, 1])
 with col1:
     headless = st.checkbox("Headless", value=True)
 with col2:
@@ -28,24 +28,23 @@ if st.button("Scarica ZIP immagini", use_container_width=True, type="primary"):
         st.stop()
 
     with st.spinner("Login + estrazione immagini..."):
-    try:
-        result = scrape_images_with_login(
-            product_url=product_url.strip(),
-            email=email.strip(),
-            password=password,
-            headless=headless,
-        )
+        try:
+            result = scrape_images_with_login(
+                product_url=product_url.strip(),
+                email=email.strip(),
+                password=password,
+                headless=headless,
+            )
 
-        zip_bytes = result.zip_bytes
-        found = result.found_image_urls
-        ok = result.downloaded_ok
-        failed = result.downloaded_failed
-        debug = result.debug
+            zip_bytes = result.zip_bytes
+            found = result.found_image_urls
+            ok = result.downloaded_ok
+            failed = result.downloaded_failed
+            debug = result.debug
 
-    except Exception as e:
-        st.error(f"Errore: {type(e).__name__}: {e}")
-        st.stop()
-
+        except Exception as e:
+            st.error(f"Errore: {type(e).__name__}: {e}")
+            st.stop()
 
     st.success(f"Immagini trovate: {len(found)} — scaricate: {len(ok)} — fallite: {len(failed)}")
 
@@ -64,4 +63,3 @@ if st.button("Scarica ZIP immagini", use_container_width=True, type="primary"):
     if show_debug:
         with st.expander("Debug"):
             st.write("\n".join(debug))
- 
