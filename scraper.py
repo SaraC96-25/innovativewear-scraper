@@ -4,15 +4,15 @@ import re
 import time
 import zipfile
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Evita che Playwright provi a scaricare browser in Streamlit Cloud
+
+# Evita che Playwright tenti download browser su Streamlit Cloud
 os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
 
 
@@ -49,184 +49,91 @@ def _guess_chromium_executable() -> Optional[str]:
 
 def _normalize_color_name(s: str) -> str:
     s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace("à", "a").replace("è", "e").replace("é", "e").replace("ì", "i").replace("ò", "o").replace("ù", "u")
+    s = re.sub(r"[\(\)\[\]\d]+", " ", s)
+    s = re.sub(r"[^a-z\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def _wanted_color_match(color_label: str, wanted: List[str]) -> bool:
+def _wanted_color_from_title(title: str) -> Optional[str]:
     """
-    wanted: lista di colori target in italiano (nero, bianco, rosso, blu navy, blu royal, grigio).
-    Proviamo a matchare con sinonimi/varianti comuni.
+    Mappa i nomi del sito alle tue categorie:
+    nero, bianco, rosso, blu_navy, blu_royal, grigio
     """
-    c = _normalize_color_name(color_label)
+    t = _normalize_color_name(title)
 
-    synonyms = {
-        "nero": ["nero", "black", "noir", "schwarz"],
-        "bianco": ["bianco", "white", "blanc", "weiss"],
-        "rosso": ["rosso", "red", "rouge", "rot", "bordeaux", "burgundy"],  # bordeaux spesso è “rosso scuro”
-        "blu navy": ["navy", "blu navy", "blu notte", "midnight", "marine", "dark blue"],
-        "blu royal": ["royal", "blu royal", "royal blue", "blu reale", "electric blue", "azzurro royal"],
-        "grigio": ["grigio", "grey", "gray", "antracite", "anthracite", "charcoal", "melange", "mélange"],
-    }
+    # Nero
+    if "black" in t:
+        return "nero"
 
-    wanted_norm = [_normalize_color_name(w) for w in wanted]
-    for w in wanted_norm:
-        # match diretto
-        if w in c:
-            return True
-        # match per cluster sinonimi
-        for syn in synonyms.get(w, []):
-            if syn in c:
-                return True
-    return False
+    # Bianco
+    if "white" in t:
+        return "bianco"
+
+    # Rosso (classic red, red, burgundy? -> tu hai detto rosso, quindi includo classic red e red;
+    # se vuoi includere anche burgundy dimmelo e lo metto)
+    if "red" in t:
+        return "rosso"
+
+    # Blu navy
+    if "navy" in t:
+        return "blu_navy"
+
+    # Blu royal
+    if "royal" in t:
+        return "blu_royal"
+
+    # Grigio
+    if "grey" in t or "gray" in t:
+        return "grigio"
+
+    return None
 
 
-def _build_color_map_from_html(html: str) -> Dict[str, str]:
+def _upgrade_to_full_res(url: str) -> str:
     """
-    Mappa best-effort: data-color -> label testuale (se presente in pagina).
-    Non conosciamo al 100% la struttura del sito, quindi facciamo euristiche.
+    Esempio: /media/.../opt-490x735-rj265m.jpg -> /media/.../rj265m.jpg
+    Togliamo 'opt-WxH-' se presente.
     """
-    soup = BeautifulSoup(html, "lxml")
-    out: Dict[str, str] = {}
-
-    # Qualsiasi elemento con attributo data-color che contiene anche un testo utile
-    for el in soup.select("[data-color]"):
-        dc = str(el.get("data-color") or "").strip()
-        if not dc:
-            continue
-
-        # prova: titolo/label vicino
-        txt = _normalize_color_name(el.get_text(" ", strip=True))
-        title = _normalize_color_name(el.get("title") or "")
-        aria = _normalize_color_name(el.get("aria-label") or "")
-        data_name = _normalize_color_name(el.get("data-name") or "")
-
-        label = next((t for t in [data_name, title, aria, txt] if t), "")
-        if label and dc not in out:
-            out[dc] = label
-
-    return out
+    return re.sub(r"/opt-\d+x\d+-", "/", url)
 
 
-def _extract_gallery_candidates(html: str, base_url: str) -> List[Tuple[str, Optional[str]]]:
-    """
-    Estrae SOLO immagini della galleria principale.
-    Ritorna lista di tuple (url_assoluto, data_color opzionale)
-    """
-    soup = BeautifulSoup(html, "lxml")
-    out: List[Tuple[str, Optional[str]]] = []
-
-    # Target principale che hai indicato
-    for img in soup.select("#js_productMainPhoto img.callToZoom, #js_productMainPhoto img"):
-        u = img.get("src") or img.get("data-src") or img.get("data-original")
-        if not u:
-            continue
-        out.append((urljoin(base_url, u), str(img.get("data-color") or "").strip() or None))
-
-    # In molti siti ci sono thumb/alt foto con classi simili (callToZoom)
-    for img in soup.select("img.callToZoom"):
-        u = img.get("src") or img.get("data-src") or img.get("data-original")
-        if not u:
-            continue
-        out.append((urljoin(base_url, u), str(img.get("data-color") or "").strip() or None))
-
-    # Dedup mantenendo ordine
-    seen = set()
-    uniq: List[Tuple[str, Optional[str]]] = []
-    for u, dc in out:
-        if u not in seen:
-            seen.add(u)
-            uniq.append((u, dc))
-
-    return uniq
-
-
-def _url_variants_highres(url: str) -> List[str]:
-    """
-    Genera candidate URL "più grandi" a partire da una URL tipo:
-    /media/.../opt-490x735-rj265m.jpg
-
-    Strategie:
-    - rimuovi prefix opt-WxH-
-    - rimuovi qualsiasi opt-...- (generico)
-    - prova a sostituire con misure comuni (solo se serve)
-    """
-    variants = [url]
-
-    # Caso tipico: opt-490x735-<name>.jpg  => <name>.jpg
-    v1 = re.sub(r"/opt-\d+x\d+-", "/", url)
-    if v1 != url:
-        variants.append(v1)
-
-    # Generico: opt-QUALCOSA-  => togli opt-
-    v2 = re.sub(r"/opt-[^/]+-", "/", url)
-    if v2 != url and v2 not in variants:
-        variants.append(v2)
-
-    # Se rimane nel filename: .../opt-490x735-rj265m.jpg
-    v3 = re.sub(r"opt-\d+x\d+-", "", url)
-    if v3 != url and v3 not in variants:
-        variants.append(v3)
-
-    # Alcuni siti hanno “large/zoom” ecc. (best effort)
-    variants.append(url.replace("/opt-", "/"))
-
-    # Dedup
-    out = []
-    seen = set()
-    for v in variants:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
-
-
-def _fetch_image_info(session: requests.Session, url: str) -> Optional[Tuple[bytes, int, int]]:
-    """
-    Scarica l'immagine e ritorna (bytes, width, height) se è un'immagine valida.
-    """
+def _head_ok(session: requests.Session, url: str) -> bool:
     try:
-        r = session.get(url, timeout=30)
-        if r.status_code != 200 or not r.content:
-            return None
-        data = r.content
-        im = Image.open(io.BytesIO(data))
-        w, h = im.size
-        return data, int(w), int(h)
+        r = session.head(url, timeout=15, allow_redirects=True)
+        if r.status_code == 200:
+            return True
+        # alcuni server non gestiscono bene HEAD: fallback GET piccolo
+        if r.status_code in (403, 405):
+            rg = session.get(url, timeout=15, stream=True, allow_redirects=True)
+            return rg.status_code == 200
+        return False
     except Exception:
-        return None
+        return False
 
 
-def _best_highres_image(session: requests.Session, url: str, debug: List[str]) -> Tuple[str, Optional[bytes]]:
+def _download_to_zip(session: requests.Session, items: List[Tuple[str, str]]) -> Tuple[bytes, List[str], List[str]]:
     """
-    Prova varianti URL e sceglie quella con area (w*h) maggiore.
+    items: [(url, filename)]
     """
-    best = None  # (area, w, h, url, bytes)
-    for v in _url_variants_highres(url):
-        info = _fetch_image_info(session, v)
-        if not info:
-            continue
-        data, w, h = info
-        area = w * h
-        if (best is None) or (area > best[0]):
-            best = (area, w, h, v, data)
-
-    if best:
-        debug.append(f"Highres OK: {url} -> {best[3]} ({best[1]}x{best[2]})")
-        return best[3], best[4]
-
-    debug.append(f"Highres FAIL: {url} (nessuna variante valida)")
-    return url, None
-
-
-def _download_to_zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
+    ok, failed = [], []
     mem = io.BytesIO()
+
     with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for i, (name, content) in enumerate(files, start=1):
-            zf.writestr(name, content)
+        for url, filename in items:
+            try:
+                r = session.get(url, timeout=30)
+                if r.status_code != 200 or not r.content:
+                    failed.append(f"{url} (HTTP {r.status_code})")
+                    continue
+
+                zf.writestr(filename, r.content)
+                ok.append(url)
+            except Exception as e:
+                failed.append(f"{url} ({type(e).__name__})")
+
     mem.seek(0)
-    return mem.getvalue()
+    return mem.getvalue(), ok, failed
 
 
 @dataclass
@@ -237,26 +144,46 @@ class ScrapeResult:
     downloaded_failed: List[str]
     debug: List[str]
 
-def _safe_click(page, selector: str, timeout_ms: int, debug: List[str]) -> bool:
-    try:
-        page.click(selector, timeout=timeout_ms)
-        return True
-    except Exception as e:
-        debug.append(f"Click failed: {selector} ({type(e).__name__})")
-        return False
 
+# -----------------------
+# Core: click colori + prendi main gallery
+# -----------------------
 
-def _collect_images_by_clicking_colors(page, base_url: str, timeout_ms: int, debug: List[str]) -> List[Tuple[str, Optional[str]]]:
+def _collect_main_images_by_selected_colors(
+    page,
+    product_url: str,
+    wanted_categories: List[str],
+    timeout_ms: int,
+    debug: List[str],
+) -> List[Tuple[str, str]]:
     """
-    Clicca tutte le varianti colore e raccoglie l'immagine principale per ciascuna.
-    Ritorna: [(img_url, data_color)]
+    Ritorna lista [(final_img_url_fullres, categoria_colore)] per i colori richiesti.
     """
-    results: List[Tuple[str, Optional[str]]] = []
+    base_url = product_url
 
-    main_img_sel = "#js_productMainPhoto img"
+    # Selector noto dai tuoi snippet
+    color_link_sel = "a.js_colorswitch.colorSwitch"
+    main_img_sel = "#js_productMainPhoto img.callToZoom"
+
     page.wait_for_selector(main_img_sel, timeout=timeout_ms)
+    page.wait_for_selector(color_link_sel, timeout=timeout_ms)
 
-    def get_main_src_and_color() -> Tuple[Optional[str], Optional[str]]:
+    color_links = page.query_selector_all(color_link_sel)
+    debug.append(f"Color links found: {len(color_links)}")
+
+    # costruisci lista di target (handle + categoria)
+    targets = []
+    for a in color_links:
+        title = (a.get_attribute("title") or "").strip()
+        cat = _wanted_color_from_title(title)
+        if cat and cat in wanted_categories:
+            dc = a.get_attribute("data-color")
+            targets.append((a, cat, title, dc))
+
+    debug.append(f"Target colors matched: {len(targets)} -> {[t[1] for t in targets]}")
+
+    # funzione per prendere src corrente + data-color
+    def get_main_src_and_dc() -> Tuple[Optional[str], Optional[str]]:
         el = page.query_selector(main_img_sel)
         if not el:
             return None, None
@@ -266,75 +193,39 @@ def _collect_images_by_clicking_colors(page, base_url: str, timeout_ms: int, deb
             src = urljoin(base_url, src)
         return src, (dc.strip() if dc else None)
 
-    # 1) prova a prendere tutti i "color swatch" cliccabili (euristica)
-    # - qualunque elemento con data-color
-    # - link/bottoni/label spesso usati per varianti
-    color_selectors = [
-        '[data-color]',                 # generico
-        'a[data-color]',
-        'button[data-color]',
-        'label[data-color]',
-        'li[data-color]',
-        '.js_changeColor [data-color]', # se esiste
-        '.colors [data-color]',
-        '.color [data-color]',
-        '#js_colors [data-color]',
-    ]
+    results: List[Tuple[str, str]] = []
+    seen_categories = set()
 
-    # prendi lista unica di elementi (Playwright locator-based)
-    handles = []
-    seen = set()
-    for sel in color_selectors:
-        for h in page.query_selector_all(sel):
-            # evita duplicati: usa outerHTML hash (grezzo ma funziona)
-            try:
-                key = h.evaluate("el => el.outerHTML")[:200]
-            except Exception:
-                key = str(h)
-            if key in seen:
-                continue
-            seen.add(key)
-            handles.append(h)
+    # clicca ogni colore richiesto (1 immagine principale per colore)
+    for idx, (handle, cat, title, dc) in enumerate(targets, start=1):
+        if cat in seen_categories:
+            continue
 
-    debug.append(f"Color candidates found: {len(handles)}")
-
-    # Se non troviamo nulla, ritorniamo solo la featured
-    if not handles:
-        src, dc = get_main_src_and_color()
-        if src:
-            results.append((src, dc))
-        return results
-
-    # 2) clicca ogni variante e aspetta cambio immagine
-    baseline_src, _ = get_main_src_and_color()
-    collected_src = set()
-
-    for idx, h in enumerate(handles, start=1):
-        # alcuni elementi non sono visibili/cliccabili -> prova scroll e click
+        # scorrimento e click
         try:
-            h.scroll_into_view_if_needed(timeout=2000)
+            handle.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
 
-        # prova click direttamente sul handle
-        old_src, _ = get_main_src_and_color()
+        old_src, _ = get_main_src_and_dc()
+        debug.append(f"[{idx}] Click color: {title} (cat={cat}, data-color={dc}) old_src={old_src}")
 
         clicked = False
         try:
-            h.click(timeout=2000)
+            handle.click(timeout=timeout_ms)
             clicked = True
         except Exception:
-            # fallback: prova click via JS
             try:
-                page.evaluate("(el) => el.click()", h)
+                page.evaluate("(el) => el.click()", handle)
                 clicked = True
             except Exception:
                 clicked = False
 
         if not clicked:
+            debug.append(f"[{idx}] Click failed on {title}")
             continue
 
-        # aspetta che cambi src (o che si stabilizzi)
+        # aspetta che l'immagine cambi (src diverso)
         try:
             page.wait_for_function(
                 """(sel, oldSrc) => {
@@ -347,31 +238,25 @@ def _collect_images_by_clicking_colors(page, base_url: str, timeout_ms: int, deb
                 timeout=timeout_ms,
             )
         except Exception:
-            # non sempre cambia src (alcuni swatch duplicati) => prosegui comunque
-            pass
+            # a volte il src non cambia per timing: aspetta un attimo
+            time.sleep(0.6)
 
         time.sleep(0.3)
 
-        src, dc = get_main_src_and_color()
-        if not src:
+        new_src, new_dc = get_main_src_and_dc()
+        debug.append(f"[{idx}] After click main src={new_src} data-color={new_dc}")
+
+        if not new_src:
             continue
 
-        if src in collected_src:
-            continue
-
-        collected_src.add(src)
-        results.append((src, dc))
-        debug.append(f"[{idx}] Collected main image: {src} (data-color={dc})")
-
-    # se per qualche motivo non ha raccolto nulla, fallback featured
-    if not results and baseline_src:
-        results.append((baseline_src, None))
+        results.append((new_src, cat))
+        seen_categories.add(cat)
 
     return results
 
 
 # -----------------------
-# Main
+# Main public function
 # -----------------------
 
 def scrape_images_with_login_sync(
@@ -379,18 +264,19 @@ def scrape_images_with_login_sync(
     email: str,
     password: str,
     headless: bool = True,
-    timeout_ms: int = 30000,
-    wanted_colors: Optional[List[str]] = None,
+    timeout_ms: int = 45000,
 ) -> ScrapeResult:
     debug: List[str] = []
-    wanted_colors = wanted_colors or ["nero", "bianco", "rosso", "blu navy", "blu royal", "grigio"]
 
     chromium_path = _guess_chromium_executable()
     if not chromium_path:
         raise RuntimeError(
             "Chromium non trovato nel container. "
-            "Aggiungi 'chromium' in packages.txt (obbligatorio) oppure imposta CHROME_PATH."
+            "Metti 'chromium' in packages.txt (e consigliato 'chromium-driver') "
+            "oppure imposta CHROME_PATH."
         )
+
+    wanted_categories = ["nero", "bianco", "rosso", "blu_navy", "blu_royal", "grigio"]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -410,90 +296,94 @@ def scrape_images_with_login_sync(
         debug.append(f"Open product: {product_url}")
         page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-        # Click login trigger (popup/modal)
-        debug.append("Click login trigger (popup/modal)")
+        # login popup trigger
+        debug.append("Click login trigger (popup)")
         page.click("a.login.js_popupLogin", timeout=timeout_ms)
 
-        # Form nel modal che mi hai dato: #user_email, #user_password, submit .js_popupDoLogin
-        debug.append("Fill login form in modal")
-        page.wait_for_selector("#js_popupSignInBody #user_email", timeout=timeout_ms)
-        page.fill("#js_popupSignInBody #user_email", email)
-        page.fill("#js_popupSignInBody #user_password", password)
+        popup_page = None
+        try:
+            popup_page = page.wait_for_event("popup", timeout=3000)
+        except PlaywrightTimeoutError:
+            popup_page = None
+
+        target = popup_page or page
+
+        debug.append("Fill login form (known ids)")
+        target.wait_for_selector("#user_email", timeout=timeout_ms)
+        target.fill("#user_email", email, timeout=timeout_ms)
+        target.fill("#user_password", password, timeout=timeout_ms)
 
         debug.append("Submit login")
-        page.click("#js_popupSignInBody .js_popupDoLogin", timeout=timeout_ms)
+        try:
+            target.click('input.js_popupDoLogin[value="Accedi"]', timeout=timeout_ms)
+        except Exception:
+            target.click('input[type="submit"][value="Accedi"]', timeout=timeout_ms)
 
-        # attesa breve per cookie/sessione
         time.sleep(1.2)
 
-        # reload prodotto con sessione attiva
-        debug.append("Reload product after login")
+        if popup_page:
+            debug.append("Close popup")
+            try:
+                popup_page.close()
+            except Exception:
+                pass
+
+        debug.append("Reload product page after login")
         page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
         time.sleep(1.0)
 
-        html = page.content()
+        # 1) raccogli immagini principali per i colori richiesti
+        debug.append("Collect main images by clicking selected colors")
+        main_images = _collect_main_images_by_selected_colors(
+            page=page,
+            product_url=product_url,
+            wanted_categories=wanted_categories,
+            timeout_ms=timeout_ms,
+            debug=debug,
+        )
 
-        # Mappa data-color -> label (best effort)
-        color_map = _build_color_map_from_html(html)
-        if color_map:
-            debug.append(f"Color map candidates: {color_map}")
+        debug.append(f"Main images collected: {len(main_images)}")
 
-        # Estrai SOLO galleria
-        candidates = _extract_gallery_candidates(html, product_url)
-        debug.append(f"Gallery candidates: {len(candidates)}")
-
-        # Filtra per colori desiderati se possibile
-        filtered: List[str] = []
-        for url, dc in candidates:
-            if dc and dc in color_map:
-                label = color_map[dc]
-                if _wanted_color_match(label, wanted_colors):
-                    filtered.append(url)
-            else:
-                # se non sappiamo il colore, NON scartiamo subito (meglio scaricare che perdere)
-                filtered.append(url)
-
-        # Dedup
-        filtered = list(dict.fromkeys(filtered))
-        debug.append(f"After color filter (best effort): {len(filtered)}")
-
-        # requests session con cookie Playwright
+        # 2) prepara requests session con cookies Playwright
+        cookies = context.cookies()
         sess = requests.Session()
         sess.headers.update({
             "User-Agent": "Mozilla/5.0 (compatible; ImageDownloader/1.0)",
             "Accept": "*/*",
             "Referer": product_url,
         })
-        for c in context.cookies():
+        for c in cookies:
             sess.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path"))
 
-        ok_urls: List[str] = []
-        failed: List[str] = []
-        files_for_zip: List[Tuple[str, bytes]] = []
+        # 3) upgrade a full-res dove possibile + costruisci zip items
+        found_urls: List[str] = []
+        zip_items: List[Tuple[str, str]] = []
 
-        for i, url in enumerate(filtered, start=1):
-            best_url, data = _best_highres_image(sess, url, debug)
-            if not data:
-                failed.append(url)
-                continue
+        for i, (url, cat) in enumerate(main_images, start=1):
+            full = _upgrade_to_full_res(url)
+            final_url = full if (full != url and _head_ok(sess, full)) else url
 
-            # estensione da url finale
+            found_urls.append(final_url)
+
+            # estensione da url
             ext = ".jpg"
-            m = re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", best_url, re.I)
+            m = re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", final_url, re.I)
             if m:
                 ext = "." + m.group(1).lower().replace("jpeg", "jpg")
 
-            filename = _clean_filename(f"gallery_{i:03d}{ext}")
-            files_for_zip.append((filename, data))
-            ok_urls.append(best_url)
+            filename = _clean_filename(f"{cat}_{i:02d}{ext}")
+            zip_items.append((final_url, filename))
 
-        zip_bytes = _download_to_zip_bytes(files_for_zip)
+            debug.append(f"Pick [{cat}] -> {final_url} as {filename}")
+
+        zip_bytes, ok, failed = _download_to_zip(sess, zip_items)
+
         browser.close()
 
         return ScrapeResult(
             zip_bytes=zip_bytes,
-            found_image_urls=filtered,
-            downloaded_ok=ok_urls,
+            found_image_urls=found_urls,
+            downloaded_ok=ok,
             downloaded_failed=failed,
             debug=debug,
         )
