@@ -14,3 +14,5 @@ libdrm2
 libxshmfence1
 ca-certificates
 fonts-liberation
+chromium
+chromium-driver
