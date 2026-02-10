@@ -8,12 +8,10 @@ from typing import List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-
-# Evita che Playwright tenti download browser su Streamlit Cloud
-os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
+# Evita che Playwright provi a scaricare browser (su Streamlit Cloud spesso fallisce)
+os.environ.setdefault("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
 
 
 # -----------------------
@@ -28,12 +26,17 @@ def _is_http_url(u: str) -> bool:
         return False
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
 def _clean_filename(name: str) -> str:
     name = re.sub(r"[^\w\-.]+", "_", name.strip())
     return name[:180] if name else "file"
 
 
 def _guess_chromium_executable() -> Optional[str]:
+    # Percorsi tipici in container Debian
     candidates = [
         os.environ.get("CHROME_PATH", ""),
         "/usr/bin/chromium",
@@ -47,93 +50,71 @@ def _guess_chromium_executable() -> Optional[str]:
     return None
 
 
-def _normalize_color_name(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[\(\)\[\]\d]+", " ", s)
-    s = re.sub(r"[^a-z\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _wanted_color_from_title(title: str) -> Optional[str]:
+def _best_image_url_candidates(img_url: str) -> List[str]:
     """
-    Mappa i nomi del sito alle tue categorie:
-    nero, bianco, rosso, blu_navy, blu_royal, grigio
+    Dal tuo esempio:
+      /media/.../opt-490x735-rj265m.jpg
+    spesso esiste anche:
+      /media/.../rj265m.jpg  (originale, più grande)
+    Quindi: proviamo prima "senza opt-WxH-", poi fallback.
     """
-    t = _normalize_color_name(title)
+    if not img_url:
+        return []
 
-    # Nero
-    if "black" in t:
-        return "nero"
+    cands = [img_url]
 
-    # Bianco
-    if "white" in t:
-        return "bianco"
+    # rimuove "opt-123x456-" se presente
+    c2 = re.sub(r"/opt-\d+x\d+-", "/", img_url)
+    if c2 != img_url:
+        cands.insert(0, c2)
 
-    # Rosso (classic red, red, burgundy? -> tu hai detto rosso, quindi includo classic red e red;
-    # se vuoi includere anche burgundy dimmelo e lo metto)
-    if "red" in t:
-        return "rosso"
+    # se ci sono thumb tipo 113x40-..., prova a rimuovere anche quello
+    c3 = re.sub(r"/\d+x\d+-", "/", img_url)
+    if c3 not in cands:
+        cands.insert(0, c3)
 
-    # Blu navy
-    if "navy" in t:
-        return "blu_navy"
-
-    # Blu royal
-    if "royal" in t:
-        return "blu_royal"
-
-    # Grigio
-    if "grey" in t or "gray" in t:
-        return "grigio"
-
-    return None
+    # unisci e dedup preservando ordine
+    out = []
+    seen = set()
+    for u in cands:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
-def _upgrade_to_full_res(url: str) -> str:
+def _pick_best_existing_url(session: requests.Session, candidates: List[str]) -> str:
     """
-    Esempio: /media/.../opt-490x735-rj265m.jpg -> /media/.../rj265m.jpg
-    Togliamo 'opt-WxH-' se presente.
+    Prova HEAD/GET leggero per capire quale URL esiste davvero.
+    Se HEAD non è permesso, ripiega su GET con stream=True.
     """
-    return re.sub(r"/opt-\d+x\d+-", "/", url)
+    for u in candidates:
+        try:
+            r = session.head(u, timeout=15, allow_redirects=True)
+            if r.status_code == 200:
+                return u
+        except Exception:
+            pass
+
+    for u in candidates:
+        try:
+            r = session.get(u, timeout=20, stream=True, allow_redirects=True)
+            if r.status_code == 200:
+                return u
+        except Exception:
+            pass
+
+    return candidates[-1] if candidates else ""
 
 
-def _head_ok(session: requests.Session, url: str) -> bool:
+def _download_bytes(session: requests.Session, url: str) -> Tuple[Optional[bytes], str]:
     try:
-        r = session.head(url, timeout=15, allow_redirects=True)
-        if r.status_code == 200:
-            return True
-        # alcuni server non gestiscono bene HEAD: fallback GET piccolo
-        if r.status_code in (403, 405):
-            rg = session.get(url, timeout=15, stream=True, allow_redirects=True)
-            return rg.status_code == 200
-        return False
-    except Exception:
-        return False
-
-
-def _download_to_zip(session: requests.Session, items: List[Tuple[str, str]]) -> Tuple[bytes, List[str], List[str]]:
-    """
-    items: [(url, filename)]
-    """
-    ok, failed = [], []
-    mem = io.BytesIO()
-
-    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for url, filename in items:
-            try:
-                r = session.get(url, timeout=30)
-                if r.status_code != 200 or not r.content:
-                    failed.append(f"{url} (HTTP {r.status_code})")
-                    continue
-
-                zf.writestr(filename, r.content)
-                ok.append(url)
-            except Exception as e:
-                failed.append(f"{url} ({type(e).__name__})")
-
-    mem.seek(0)
-    return mem.getvalue(), ok, failed
+        r = session.get(url, timeout=40, allow_redirects=True)
+        if r.status_code != 200 or not r.content:
+            return None, f"HTTP {r.status_code}"
+        return r.content, ""
+    except Exception as e:
+        return None, type(e).__name__
 
 
 @dataclass
@@ -146,123 +127,117 @@ class ScrapeResult:
 
 
 # -----------------------
-# Core: click colori + prendi main gallery
+# Core logic
 # -----------------------
 
-def _collect_main_images_by_selected_colors(
-    page,
-    product_url: str,
-    wanted_categories: List[str],
-    timeout_ms: int,
-    debug: List[str],
-) -> List[Tuple[str, str]]:
+def _login_via_modal(page, email: str, password: str, timeout_ms: int, debug: List[str]) -> None:
+    # Trigger: a.login.js_popupLogin
+    debug.append("Click login trigger (popup modal)")
+    page.click("a.login.js_popupLogin", timeout=timeout_ms)
+
+    debug.append("Wait modal body")
+    page.wait_for_selector("#js_popupSignInBody", timeout=timeout_ms)
+
+    debug.append("Fill email/password")
+    page.fill("#user_email", email, timeout=timeout_ms)
+    page.fill("#user_password", password, timeout=timeout_ms)
+
+    debug.append("Submit login")
+    page.click("input.js_popupDoLogin, input[type='submit'][value*='Accedi']", timeout=timeout_ms)
+
+    # Aspetta che il modal sparisca o che cambi qualcosa in pagina
+    try:
+        page.wait_for_selector("#js_popupSignInBody", state="detached", timeout=timeout_ms)
+        debug.append("Modal closed after login")
+    except PlaywrightTimeoutError:
+        debug.append("Modal did not detach (ok if site keeps it hidden). Continue.")
+
+    # Small buffer for session cookies
+    time.sleep(1.5)
+
+
+def _extract_color_swatch_map(page, timeout_ms: int, debug: List[str]):
     """
-    Ritorna lista [(final_img_url_fullres, categoria_colore)] per i colori richiesti.
+    Legge tutte le swatch:
+    <a class="js_colorswitch colorSwitch" data-color="CR" title="Classic Red (CR)">...
+       <div class="color-code-thumb">CR</div>
     """
-    base_url = product_url
+    swatches = page.locator("a.js_colorswitch.colorSwitch")
+    n = swatches.count()
+    debug.append(f"Found swatches: {n}")
 
-    # Selector noto dai tuoi snippet
-    color_link_sel = "a.js_colorswitch.colorSwitch"
-    main_img_sel = "#js_productMainPhoto img.callToZoom"
+    items = []
+    for i in range(n):
+        h = swatches.nth(i)
+        title = (h.get_attribute("title") or "").strip()
+        data_color = (h.get_attribute("data-color") or "").strip()
 
-    page.wait_for_selector(main_img_sel, timeout=timeout_ms)
-    page.wait_for_selector(color_link_sel, timeout=timeout_ms)
-
-    color_links = page.query_selector_all(color_link_sel)
-    debug.append(f"Color links found: {len(color_links)}")
-
-    # costruisci lista di target (handle + categoria)
-    targets = []
-    for a in color_links:
-        title = (a.get_attribute("title") or "").strip()
-        cat = _wanted_color_from_title(title)
-        if cat and cat in wanted_categories:
-            dc = a.get_attribute("data-color")
-            targets.append((a, cat, title, dc))
-
-    debug.append(f"Target colors matched: {len(targets)} -> {[t[1] for t in targets]}")
-
-    # funzione per prendere src corrente + data-color
-    def get_main_src_and_dc() -> Tuple[Optional[str], Optional[str]]:
-        el = page.query_selector(main_img_sel)
-        if not el:
-            return None, None
-        src = el.get_attribute("src") or el.get_attribute("data-src")
-        dc = el.get_attribute("data-color")
-        if src:
-            src = urljoin(base_url, src)
-        return src, (dc.strip() if dc else None)
-
-    results: List[Tuple[str, str]] = []
-    seen_categories = set()
-
-    # clicca ogni colore richiesto (1 immagine principale per colore)
-    for idx, (handle, cat, title, dc) in enumerate(targets, start=1):
-        if cat in seen_categories:
-            continue
-
-        # scorrimento e click
+        code_text = ""
         try:
-            handle.scroll_into_view_if_needed(timeout=2000)
+            code_text = h.locator(
+                "xpath=ancestor::div[contains(@class,'wrapperSwitchColore')]//div[contains(@class,'color-code-thumb')]"
+            ).inner_text(timeout=300).strip()
         except Exception:
             pass
 
-        old_src, _ = get_main_src_and_dc()
-        debug.append(f"[{idx}] Click color: {title} (cat={cat}, data-color={dc}) old_src={old_src}")
+        items.append({
+            "index": i,
+            "handle": h,
+            "title": title,
+            "data_color": data_color,
+            "code_text": code_text,
+        })
 
-        clicked = False
-        try:
-            handle.click(timeout=timeout_ms)
-            clicked = True
-        except Exception:
-            try:
-                page.evaluate("(el) => el.click()", handle)
-                clicked = True
-            except Exception:
-                clicked = False
-
-        if not clicked:
-            debug.append(f"[{idx}] Click failed on {title}")
-            continue
-
-        # aspetta che l'immagine cambi (src diverso)
-        try:
-            page.wait_for_function(
-                """(sel, oldSrc) => {
-                    const el = document.querySelector(sel);
-                    if(!el) return false;
-                    const s = el.getAttribute('src') || el.getAttribute('data-src') || '';
-                    return s && s !== oldSrc;
-                }""",
-                arg=(main_img_sel, old_src or ""),
-                timeout=timeout_ms,
-            )
-        except Exception:
-            # a volte il src non cambia per timing: aspetta un attimo
-            time.sleep(0.6)
-
-        time.sleep(0.3)
-
-        new_src, new_dc = get_main_src_and_dc()
-        debug.append(f"[{idx}] After click main src={new_src} data-color={new_dc}")
-
-        if not new_src:
-            continue
-
-        results.append((new_src, cat))
-        seen_categories.add(cat)
-
-    return results
+    return items
 
 
-# -----------------------
-# Main public function
-# -----------------------
+def _match_swatch(item, wanted_norm: List[str]) -> bool:
+    if not wanted_norm:
+        return True
+
+    t = _norm(item["title"])
+    dc = _norm(item["data_color"])
+    ct = _norm(item["code_text"])
+
+    for w in wanted_norm:
+        # match “codice” esatto
+        if w and (w == dc or w == ct):
+            return True
+        # match sul titolo (contains)
+        if w and w in t:
+            return True
+
+    return False
+
+
+def _wait_after_color_change(page, seconds: int, debug: List[str]) -> None:
+    debug.append(f"Wait after click: {seconds}s")
+    time.sleep(max(0, int(seconds)))
+
+
+def _get_main_photo_url(page, product_url: str, timeout_ms: int, debug: List[str]) -> str:
+    """
+    Prende SOLO la foto principale nella gallery:
+      #js_productMainPhoto img.callToZoom
+    """
+    page.wait_for_selector("#js_productMainPhoto img.callToZoom", timeout=timeout_ms)
+    src = page.locator("#js_productMainPhoto img.callToZoom").get_attribute("src") or ""
+    src = src.strip()
+
+    if not src:
+        return ""
+
+    full = urljoin(product_url, src)
+    debug.append(f"Main photo src: {full}")
+    return full
+
 
 def scrape_images_with_login_sync(
     product_url: str,
     email: str,
     password: str,
+    wanted_colors: Optional[List[str]] = None,
+    wait_after_click_seconds: int = 15,
     headless: bool = True,
     timeout_ms: int = 45000,
 ) -> ScrapeResult:
@@ -272,11 +247,11 @@ def scrape_images_with_login_sync(
     if not chromium_path:
         raise RuntimeError(
             "Chromium non trovato nel container. "
-            "Metti 'chromium' in packages.txt (e consigliato 'chromium-driver') "
-            "oppure imposta CHROME_PATH."
+            "Metti 'chromium' in packages.txt oppure imposta CHROME_PATH."
         )
 
-    wanted_categories = ["nero", "bianco", "rosso", "blu_navy", "blu_royal", "grigio"]
+    wanted_norm = [_norm(x) for x in (wanted_colors or []) if _norm(x)]
+    debug.append(f"Wanted colors (normalized): {wanted_norm}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -296,55 +271,14 @@ def scrape_images_with_login_sync(
         debug.append(f"Open product: {product_url}")
         page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-        # login popup trigger
-        debug.append("Click login trigger (popup)")
-        page.click("a.login.js_popupLogin", timeout=timeout_ms)
+        _login_via_modal(page, email=email, password=password, timeout_ms=timeout_ms, debug=debug)
 
-        popup_page = None
-        try:
-            popup_page = page.wait_for_event("popup", timeout=3000)
-        except PlaywrightTimeoutError:
-            popup_page = None
-
-        target = popup_page or page
-
-        debug.append("Fill login form (known ids)")
-        target.wait_for_selector("#user_email", timeout=timeout_ms)
-        target.fill("#user_email", email, timeout=timeout_ms)
-        target.fill("#user_password", password, timeout=timeout_ms)
-
-        debug.append("Submit login")
-        try:
-            target.click('input.js_popupDoLogin[value="Accedi"]', timeout=timeout_ms)
-        except Exception:
-            target.click('input[type="submit"][value="Accedi"]', timeout=timeout_ms)
-
-        time.sleep(1.2)
-
-        if popup_page:
-            debug.append("Close popup")
-            try:
-                popup_page.close()
-            except Exception:
-                pass
-
+        # Ricarica prodotto con sessione
         debug.append("Reload product page after login")
         page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
         time.sleep(1.0)
 
-        # 1) raccogli immagini principali per i colori richiesti
-        debug.append("Collect main images by clicking selected colors")
-        main_images = _collect_main_images_by_selected_colors(
-            page=page,
-            product_url=product_url,
-            wanted_categories=wanted_categories,
-            timeout_ms=timeout_ms,
-            debug=debug,
-        )
-
-        debug.append(f"Main images collected: {len(main_images)}")
-
-        # 2) prepara requests session con cookies Playwright
+        # Sessione requests con cookie di Playwright
         cookies = context.cookies()
         sess = requests.Session()
         sess.headers.update({
@@ -355,35 +289,97 @@ def scrape_images_with_login_sync(
         for c in cookies:
             sess.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path"))
 
-        # 3) upgrade a full-res dove possibile + costruisci zip items
+        # Legge swatch e decide cosa cliccare
+        swatch_items = _extract_color_swatch_map(page, timeout_ms=timeout_ms, debug=debug)
+
+        # Se l’utente ha lista colori, clicchiamo nell’ORDINE dell’utente.
+        # Per farlo, per ogni wanted cerchiamo la prima swatch che matcha.
+        ordered_to_click = []
+        if wanted_norm:
+            for w in wanted_norm:
+                match = None
+                for it in swatch_items:
+                    # match "forte": codice esatto o titolo contiene
+                    t = _norm(it["title"])
+                    dc = _norm(it["data_color"])
+                    ct = _norm(it["code_text"])
+                    if w == dc or w == ct or (w in t):
+                        match = it
+                        break
+                if match:
+                    ordered_to_click.append(match)
+                else:
+                    debug.append(f"WARNING: no swatch matched '{w}'")
+        else:
+            # Se non specifichi lista, clicca tutte le swatch trovate (non consigliato, ma utile)
+            ordered_to_click = [it for it in swatch_items if _match_swatch(it, wanted_norm)]
+
+        debug.append(f"Swatches selected for clicking: {len(ordered_to_click)}")
+
         found_urls: List[str] = []
-        zip_items: List[Tuple[str, str]] = []
+        downloaded_ok: List[str] = []
+        downloaded_failed: List[str] = []
 
-        for i, (url, cat) in enumerate(main_images, start=1):
-            full = _upgrade_to_full_res(url)
-            final_url = full if (full != url and _head_ok(sess, full)) else url
+        # ZIP in memoria
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for k, it in enumerate(ordered_to_click, start=1):
+                title = it["title"]
+                data_color = it["data_color"]
+                code_text = it["code_text"]
 
-            found_urls.append(final_url)
+                label = code_text or data_color or title or f"color_{k}"
+                label_clean = _clean_filename(label)
 
-            # estensione da url
-            ext = ".jpg"
-            m = re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", final_url, re.I)
-            if m:
-                ext = "." + m.group(1).lower().replace("jpeg", "jpg")
+                debug.append(f"[{k}] Click swatch: title='{title}' data-color='{data_color}' code='{code_text}'")
 
-            filename = _clean_filename(f"{cat}_{i:02d}{ext}")
-            zip_items.append((final_url, filename))
+                # click e attesa lunga (come richiesto)
+                try:
+                    it["handle"].click(timeout=timeout_ms)
+                except Exception as e:
+                    downloaded_failed.append(f"{label} (click failed: {type(e).__name__})")
+                    debug.append(f"[{k}] ERROR click: {type(e).__name__}: {e}")
+                    continue
 
-            debug.append(f"Pick [{cat}] -> {final_url} as {filename}")
+                _wait_after_color_change(page, wait_after_click_seconds, debug)
 
-        zip_bytes, ok, failed = _download_to_zip(sess, zip_items)
+                # prendi SOLO immagine principale (gallery)
+                main_url = _get_main_photo_url(page, product_url=product_url, timeout_ms=timeout_ms, debug=debug)
+                if not main_url:
+                    downloaded_failed.append(f"{label} (main image not found)")
+                    continue
+
+                found_urls.append(main_url)
+
+                # prova a prendere versione hi-res
+                cands = _best_image_url_candidates(main_url)
+                best = _pick_best_existing_url(sess, cands)
+                debug.append(f"[{k}] Best candidate: {best}")
+
+                img_bytes, err = _download_bytes(sess, best)
+                if not img_bytes:
+                    downloaded_failed.append(f"{best} ({err})")
+                    continue
+
+                # estensione
+                ext = ".jpg"
+                m = re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", best, re.I)
+                if m:
+                    ext = "." + m.group(1).lower().replace("jpeg", "jpg")
+
+                filename = _clean_filename(f"{k:02d}_{label_clean}{ext}")
+                zf.writestr(filename, img_bytes)
+                downloaded_ok.append(best)
+
+        mem.seek(0)
+        zip_bytes = mem.getvalue()
 
         browser.close()
 
         return ScrapeResult(
             zip_bytes=zip_bytes,
             found_image_urls=found_urls,
-            downloaded_ok=ok,
-            downloaded_failed=failed,
+            downloaded_ok=downloaded_ok,
+            downloaded_failed=downloaded_failed,
             debug=debug,
         )
